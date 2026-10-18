@@ -1,0 +1,133 @@
+name: Build hmp3 (clang + PGO, win64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      train_wav_url:
+        description: "Optional: direct URL to a real-music WAV used as extra PGO training data"
+        required: false
+        default: ""
+      extra_march:
+        description: "Optional: build one extra variant with this -march (e.g. znver4, x86-64-v4)"
+        required: false
+        default: ""
+      release:
+        description: "Publish a GitHub release with the binaries"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*", "*-pgo*"]
+
+permissions:
+  contents: write
+
+jobs:
+  variants:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          # Variant set follows L4cache's clang+PGO benchmarks; znver4+fast-math is
+          # deliberately absent (it was ~2x SLOWER with clang there).
+          m='[{"name":"normal","march":"x86-64","fm":"0"},
+              {"name":"fast-math","march":"x86-64","fm":"1"},
+              {"name":"x86-64-v3","march":"x86-64-v3","fm":"0"},
+              {"name":"x86-64-v3-fast-math","march":"x86-64-v3","fm":"1"}'
+          x="${{ github.event.inputs.extra_march }}"
+          if [ -n "$x" ]; then m="$m,{\"name\":\"$x\",\"march\":\"$x\",\"fm\":\"0\"}"; fi
+          echo "matrix={\"include\":$(echo "$m]" | tr -d '\n ')}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: variants
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.variants.outputs.matrix) }}
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          pacboy: >-
+            toolchain:p
+          install: >-
+            curl
+            zip
+
+      - name: Fetch optional training WAV
+        if: github.event.inputs.train_wav_url != ''
+        run: |
+          mkdir -p train-extra
+          curl -fL --retry 3 -o train-extra/music.wav "${{ github.event.inputs.train_wav_url }}"
+          head -c 4 train-extra/music.wav | grep -q RIFF || { echo "Not a WAV file"; exit 1; }
+          echo "TRAIN_WAV=$PWD/train-extra/music.wav" >> "$GITHUB_ENV"
+
+      - name: Build (clang + LTO + PGO)
+        env:
+          MARCH: ${{ matrix.march }}
+          FAST_MATH: ${{ matrix.fm }}
+          BENCH: "1"
+        run: |
+          clang --version
+          ./scripts/build-clang-pgo.sh
+
+      - name: Package
+        id: pkg
+        run: |
+          ver=$(git describe --tags --always)
+          name="hmp3-${ver}-clang-pgo-${{ matrix.name }}-win64"
+          mkdir -p dist
+          cp builds/clang-pgo/out/hmp3.exe dist/hmp3.exe
+          cp hmp3/LICENSE.txt dist/ 2>/dev/null || true
+          {
+            echo "hmp3 ${ver}"
+            echo "compiler : $(clang --version | head -n1)"
+            echo "flags    : -O3 -flto -march=${{ matrix.march }}$([ '${{ matrix.fm }}' = 1 ] && echo ' -ffast-math') + PGO (instrumented)"
+            echo "env      : MSYS2 CLANG64, static, lld"
+          } > dist/BUILDINFO.txt
+          (cd dist && zip -9 "../${name}.zip" *)
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+          merge-multiple: true
+      - id: tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then t="${GITHUB_REF#refs/tags/}"; else t="clang-pgo-$(date -u +%Y%m%d-%H%M)"; fi
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: hmp3 ${{ steps.tag.outputs.tag }} (clang + PGO, win64)
+          files: dl/*.zip
+          body: |
+            Static win64 builds made with clang (MSYS2 CLANG64) + full LTO + instrumented PGO.
+
+            | variant | CPU requirement |
+            |---|---|
+            | normal / fast-math | any x86-64 |
+            | x86-64-v3 / x86-64-v3-fast-math | AVX2 (Haswell+, Zen+) |
+
+            `-march` and fast-math variants produce slightly different (but valid) output.
